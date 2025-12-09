@@ -6,29 +6,40 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters.command import Command
 from aiohttp import web
 
-# --- CONFIGURATION FROM ENVIRONMENT VARIABLES ---
-# We use os.getenv to read secrets from Render's settings
+# --- CONFIGURATION ---
 API_TOKEN = os.getenv('TELEGRAM_TOKEN')
 NUMVERIFY_KEY = os.getenv('NUMVERIFY_KEY')
-PORT = int(os.getenv('PORT', 8080)) # Render provides a PORT automatically
+PORT = int(os.getenv('PORT', 8080))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Initialize bot and dispatcher
+# Initialize bot
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# --- HELPER FUNCTIONS ---
 def get_phone_metadata(phone_number):
     if not NUMVERIFY_KEY:
-        return "⚠️ Error: Numverify API Key is missing in settings."
-        
-    url = f"http://apilayer.net/api/validate?access_key={NUMVERIFY_KEY}&number={phone_number}"
+        return "⚠️ Error: API Key is missing."
+
+    # --- TRY APILAYER METHOD (Newer) ---
+    # Most new accounts come from APILayer.com and need this specific format
+    url = f"https://api.apilayer.com/number_verification/validate?number={phone_number}"
+    headers = {"apikey": NUMVERIFY_KEY}
+    
     try:
-        response = requests.get(url)
+        response = requests.get(url, headers=headers)
         data = response.json()
-        if data.get('valid'):
+        
+        # If APILayer fails (e.g., using old legacy key), try the old URL
+        if "error" in data or "message" in data:
+             # Fallback to Legacy Method (http://apilayer.net)
+             legacy_url = f"http://apilayer.net/api/validate?access_key={NUMVERIFY_KEY}&number={phone_number}"
+             response = requests.get(legacy_url)
+             data = response.json()
+
+        # Check if valid
+        if data.get('valid') is True:
             return (
                 f"✅ **Valid Number**\n"
                 f"🏳️ **Country:** {data.get('country_name')} ({data.get('country_code')})\n"
@@ -36,27 +47,31 @@ def get_phone_metadata(phone_number):
                 f"🏢 **Carrier:** {data.get('carrier')}\n"
                 f"📞 **Line Type:** {data.get('line_type')}"
             )
+        elif data.get('valid') is False:
+             return f"❌ This number is invalid (according to the database)."
         else:
-            return "❌ Invalid number or API limit reached."
-    except Exception as e:
-        return f"⚠️ Error: {str(e)}"
+            # This prints the ACTUAL error from the server so we can debug
+            return f"⚠️ API Error Details: {data}"
 
-# --- BOT COMMANDS ---
+    except Exception as e:
+        return f"⚠️ System Error: {str(e)}"
+
+# --- COMMANDS ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("Hello! Send me a phone number (e.g., +15550199) to check its carrier.")
+    await message.answer("Hello! Send me a phone number (e.g., +14155552671).")
 
 @dp.message()
 async def check_number(message: types.Message):
-    phone_number = message.text.strip()
-    if phone_number.startswith("+") and phone_number[1:].isdigit():
-        await message.answer("Checking database... ⏳")
-        result = get_phone_metadata(phone_number)
+    phone = message.text.strip()
+    if len(phone) > 7:  # Basic length check
+        await message.answer("Checking... ⏳")
+        result = get_phone_metadata(phone)
         await message.answer(result, parse_mode="Markdown")
     else:
-        await message.answer("Please send the number in International Format (e.g., +14155552671).")
+        await message.answer("Please send a valid international number (e.g., +1...)")
 
-# --- DUMMY WEB SERVER FOR RENDER ---
+# --- SERVER ---
 async def handle(request):
     return web.Response(text="Bot is running!")
 
@@ -68,11 +83,8 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
 
-# --- MAIN ENTRY POINT ---
 async def main():
-    # Start the dummy web server so Render thinks we are a website
     await start_web_server()
-    # Start the bot polling
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
