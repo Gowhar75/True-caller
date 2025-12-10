@@ -2,17 +2,14 @@ import logging
 import os
 import requests
 import asyncio
-import json
+import re
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters.command import Command
 from aiohttp import web
-from truecallerpy import search_phonenumber
 
 # --- CONFIGURATION ---
 API_TOKEN = os.getenv('TELEGRAM_TOKEN')
-NUMVERIFY_KEY = os.getenv('NUMVERIFY_KEY')
-# You must run 'truecallerpy login' in terminal to get this ID
-TRUECALLER_ID = os.getenv('TRUECALLER_ID') 
+NUMVERIFY_KEY = os.getenv('NUMVERIFY_KEY') # Still needed for phone numbers
 PORT = int(os.getenv('PORT', 8080))
 
 # Configure logging
@@ -22,13 +19,10 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
+# --- FUNCTION 1: PHONE LOOKUP (NumVerify) ---
 def get_phone_metadata(phone_number):
-    """
-    Fetches technical data (Carrier, Location, Country) from NumVerify.
-    Returns: dictionary of data OR None if error.
-    """
     if not NUMVERIFY_KEY:
-        return None
+        return "⚠️ Error: NUMVERIFY_KEY is missing in settings."
 
     url = f"https://api.apilayer.com/number_verification/validate?number={phone_number}"
     headers = {"apikey": NUMVERIFY_KEY}
@@ -37,99 +31,89 @@ def get_phone_metadata(phone_number):
         response = requests.get(url, headers=headers)
         data = response.json()
         
-        # Fallback for legacy API layer if needed
+        # Fallback to legacy URL if needed
         if "error" in data or "message" in data:
              legacy_url = f"http://apilayer.net/api/validate?access_key={NUMVERIFY_KEY}&number={phone_number}"
              response = requests.get(legacy_url)
              data = response.json()
 
-        return data
+        if data.get('valid') is True:
+            return (
+                f"📱 **PHONE REPORT**\n"
+                f"✅ **Valid Number**\n"
+                f"🏳️ **Country:** {data.get('country_name')} ({data.get('country_code')})\n"
+                f"📍 **Location:** {data.get('location')}\n"
+                f"🏢 **Carrier:** {data.get('carrier')}\n"
+                f"📞 **Line Type:** {data.get('line_type')}"
+            )
+        elif data.get('valid') is False:
+             return f"❌ This number is invalid."
+        else:
+            return f"⚠️ API Error: {data}"
+
     except Exception as e:
-        logging.error(f"NumVerify Error: {e}")
-        return None
+        return f"⚠️ System Error: {str(e)}"
 
-async def get_caller_name(phone_number, country_code):
-    """
-    Fetches the Person/Business Name using TrueCaller.
-    """
-    if not TRUECALLER_ID:
-        return "⚠️ (TrueCaller ID missing in Config)"
-
+# --- FUNCTION 2: IP LOOKUP (IP-API) ---
+def get_ip_metadata(ip_address):
+    # Free API, no key required for basic usage
+    url = f"http://ip-api.com/json/{ip_address}?fields=status,message,country,countryCode,regionName,city,zip,isp,org,as,query"
+    
     try:
-        # TrueCaller requires the number without the leading '+' usually, 
-        # but the library handles it best if we just pass the ID and Country code.
-        # Running in a thread because truecallerpy is synchronous
-        id_str = str(TRUECALLER_ID)
-        
-        # Clean phone number for TrueCaller (remove +)
-        clean_phone = phone_number.replace("+", "")
-        
-        # search_phonenumber returns a JSON result
-        result = await asyncio.to_thread(
-            search_phonenumber, 
-            clean_phone, 
-            country_code, 
-            id_str
-        )
-        
-        # Parse the result
-        if result and "data" in result and len(result["data"]) > 0:
-            user_data = result["data"][0]
-            name = user_data.get("name", "Unknown")
-            # Check if there is a verified badge or spam score
-            spam_score = user_data.get("spam_score", 0)
-            spam_warning = "🚨 (Spam)" if spam_score and spam_score > 10 else ""
-            return f"{name} {spam_warning}"
-            
-        return "Unknown (Not found on TrueCaller)"
-        
+        response = requests.get(url)
+        data = response.json()
+
+        if data.get('status') == 'success':
+            return (
+                f"💻 **IP ADDRESS REPORT**\n"
+                f"🌍 **IP:** `{data.get('query')}`\n"
+                f"🏳️ **Country:** {data.get('country')} ({data.get('countryCode')})\n"
+                f"🏙️ **City:** {data.get('city')}, {data.get('regionName')}\n"
+                f"📮 **Zip Code:** {data.get('zip')}\n"
+                f"🏢 **ISP:** {data.get('isp')}\n"
+                f"🏢 **Org:** {data.get('org')}"
+            )
+        else:
+            return f"❌ Invalid IP or Private Network ({data.get('message')})"
     except Exception as e:
-        logging.error(f"TrueCaller Error: {e}")
-        return "Error fetching name"
+        return f"⚠️ IP Lookup Error: {str(e)}"
 
 # --- COMMANDS ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("Hello! Send me a phone number (e.g., +14155552671).")
+    welcome_msg = (
+        "🤖 **Bot is Ready!**\n\n"
+        "1️⃣ Send a **Phone Number** (e.g., `+919999999999`) to check Carrier/Location.\n"
+        "2️⃣ Send an **IP Address** (e.g., `8.8.8.8`) to check ISP/City."
+    )
+    await message.answer(welcome_msg, parse_mode="Markdown")
 
 @dp.message()
-async def check_number(message: types.Message):
-    phone = message.text.strip()
+async def check_input(message: types.Message):
+    text = message.text.strip()
     
-    if len(phone) > 7:
-        status_msg = await message.answer("Checking Database... ⏳")
+    # LOGIC: Check if it looks like a phone number or an IP
+    # A phone number usually starts with + or has 10-15 digits
+    # An IP address usually has dots like 192.168.1.1
+    
+    if text.startswith("+") or (text.isdigit() and len(text) > 9):
+        # ---> It's a PHONE NUMBER
+        status_msg = await message.answer("🔍 Detecting Phone Number... ⏳")
+        result = await asyncio.to_thread(get_phone_metadata, text)
+        await status_msg.edit_text(result, parse_mode="Markdown")
         
-        # 1. Get Technical Metadata (NumVerify)
-        nv_data = await asyncio.to_thread(get_phone_metadata, phone)
+    elif re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", text):
+        # ---> It's an IP ADDRESS
+        status_msg = await message.answer("🌍 Tracking IP Address... ⏳")
+        result = await asyncio.to_thread(get_ip_metadata, text)
+        await status_msg.edit_text(result, parse_mode="Markdown")
         
-        if not nv_data:
-            await status_msg.edit_text("❌ Error connecting to Verification API.")
-            return
-
-        if nv_data.get('valid') is True:
-            country_code = nv_data.get('country_code', 'IN') # Default to IN if missing
-            
-            # 2. Get Name (TrueCaller) - Needs country code from step 1 for best results
-            await status_msg.edit_text("Found carrier... fetching name... 🔍")
-            caller_name = await get_caller_name(phone, country_code)
-            
-            # 3. Formulate Response
-            response_text = (
-                f"👤 **Name:** {caller_name}\n"
-                f"✅ **Valid Number**\n"
-                f"🏳️ **Country:** {nv_data.get('country_name')} ({nv_data.get('country_code')})\n"
-                f"📍 **Location:** {nv_data.get('location')}\n"
-                f"🏢 **Carrier:** {nv_data.get('carrier')}\n"
-                f"📞 **Line Type:** {nv_data.get('line_type')}"
-            )
-            await status_msg.edit_text(response_text, parse_mode="Markdown")
-            
-        elif nv_data.get('valid') is False:
-             await status_msg.edit_text("❌ This number is invalid (according to NumVerify).")
-        else:
-            await status_msg.edit_text(f"⚠️ API Error: {nv_data}")
     else:
-        await message.answer("Please send a valid international number (e.g., +1...)")
+        await message.answer(
+            "⚠️ I didn't understand that.\n"
+            "- For Phones: Start with + (e.g., +1...)\n"
+            "- For IPs: Use dots (e.g., 1.1.1.1)"
+        )
 
 # --- SERVER ---
 async def handle(request):
